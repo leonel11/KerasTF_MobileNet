@@ -11,6 +11,8 @@ from keras.applications.mobilenet import MobileNet
 from keras.optimizers import TFOptimizer
 from keras import backend as K # backend of Keras
 from keras.utils import multi_gpu_model, to_categorical
+from keras.callbacks import ModelCheckpoint
+from multiprocessing import cpu_count
 import scipy.misc
 
 
@@ -19,11 +21,15 @@ K.set_image_dim_ordering('tf') # use Tensorflow backend
 
 
 # parameters of learning for the network
-EPOCHES = 2 # how many times the whole train set will be shown for model
+EPOCHES = 10 # how many times the whole train set will be shown for model
 BATCH_SIZE = 128 # count of train samples, which are shown to optimizer before updating weights of network
 IMG_ROWS, IMG_COLS = 224, 224 # size of images (at least 32x32)
 IMG_CHANNELS = 1 # colour channels of images
 CLASSES = 1000
+
+# folders for savings
+RESULTS_DIR = '../results'
+WEIGHTS_DIR = 'weights'
 
 
 # parameters of optimizer
@@ -32,7 +38,7 @@ DECAY = 0.9
 MOMENTUM = 0.9
 
 
-def get_batch(data_path, data_list, batch_size):
+def generator(data_path, data_list, batch_size):
     """
     Form batch for training or testing
     @param data_path: path to the data folder
@@ -41,30 +47,18 @@ def get_batch(data_path, data_list, batch_size):
     @return:
     """
     indeces = np.random.randint(data_list.shape[0], size=batch_size) # indices of pictures of formed batch
+    x = np.zeros((batch_size, IMG_ROWS, IMG_COLS, IMG_CHANNELS))
+    y = np.zeros((batch_size, 1))
     for i, idx in enumerate(indeces):
-        label = np.array([int(data_list.iloc[idx][1])])
+        label = int(data_list.iloc[idx][1])
         img = scipy.misc.imresize(scipy.misc.imread(os.path.join(data_path, data_list.iloc[idx][0]),
-                                                    flatten=True, mode='LA'), (224, 224)) # read reshaped image
+                                                    flatten=True, mode='LA'), (IMG_ROWS, IMG_COLS)) # read reshaped image
         # image -> numpy normalized array
         arr_img = np.array(img).astype('float32') / 255.0
         arr_img = arr_img[np.newaxis, :, :, np.newaxis]
-        # add data to batch
-        if i == 0:
-            x = arr_img
-            y = label
-        else:
-            x = np.concatenate([x, arr_img])
-            y = np.concatenate([y, label])
-    return x, to_categorical(y, num_classes=CLASSES)
-
-
-def get_gpus(gpus):
-    """
-    Get numbers of GPU devices
-    @param gpus: numbers of GPU-videocards for training the network
-    @return: list with drivers of GPU-devices
-    """
-    return list(map(int, gpus.split(',')))
+        x[i] = arr_img
+        y[i] = label
+    yield x, to_categorical(y, num_classes=CLASSES)
 
 
 def get_optimizer():
@@ -84,29 +78,23 @@ def get_model(optimizer, gpus):
     @param optimizer: optimizing function for training the network
     @return: compiled MobileNet model
     """
-    model = MobileNet(input_shape=(IMG_ROWS, IMG_ROWS, IMG_CHANNELS),
-                      alpha=1.0, # control the width of the network
-                      include_top=True, # including FC-layers at the network
-                      weights=None,
-                      classes=CLASSES)
     '''
     Architecture of MobileNet v1:
     [Conv 3x3] -> [BatchNorm] -> [ReLU] ->
     -> (x13) [Deepthwise Conv 3x3] -> [BatchNorm] -> [ReLU] -> [Conv 1x1] -> [BatchNorm] -> [ReLU]
     '''
-    model.summary() # print the architecture of model
     # TODO: optimize work on many GPUs
-    if len(gpus) == 1:
-        with K.tf.device('/gpu:{}'.format(gpus[0])):
-            parallel_model = model
-    else:
-        with K.tf.device('/cpu:0'):
-            kernel_model = model
-        parallel_model = multi_gpu_model(kernel_model, gpus=gpus)
+    with K.tf.device('/cpu:0'):
+        kernel_model = MobileNet(input_shape=(IMG_ROWS, IMG_ROWS, IMG_CHANNELS),
+                                 alpha=1.0, # control the width of the network
+                                 include_top=True, # including FC-layers at the network
+                                 weights=None,
+                                 classes=CLASSES)
+    parallel_model = multi_gpu_model(kernel_model, gpus=gpus)
     parallel_model.compile(optimizer=optimizer,
                            loss='categorical_crossentropy', # for multiclass classification
                            metrics=['accuracy'])
-    return parallel_model, model
+    return parallel_model
 
 
 def train(model, data_path, train_list_file, val_list_file):
@@ -119,7 +107,6 @@ def train(model, data_path, train_list_file, val_list_file):
     """
     train_path = os.path.join(data_path, 'train')
     val_path = os.path.join(data_path, 'val')
-    history = {'loss': [], 'val_loss': [], 'acc': [], 'val_acc': []}
     # check the rightness of data
     if not os.path.isdir(data_path) or not os.path.isdir(train_path) or not os.path.join(val_path):
         print('The dataset doesn\'t have the right arragement (\'train\' and \'val\' data with proper data)')
@@ -128,26 +115,22 @@ def train(model, data_path, train_list_file, val_list_file):
     val_list = pd.read_csv(val_list_file, sep=' ')
     count_batches = int(train_list.shape[0]/BATCH_SIZE)
     print('\nStart training...\n')
-    # manual implementation of training and validation
-    for ep in range(EPOCHES):
-        print('\nEpoch {}/{}\n'.format(ep+1, EPOCHES))
-        train_loss = []
-        train_acc = []
-        # Training a epoch
-        for b in range(count_batches):
-            x_train, y_train = get_batch(train_path, train_list, BATCH_SIZE)
-            hist = model.train_on_batch(x_train, y_train)
-            train_loss.append(hist[0])
-            train_acc.append(hist[1])
-            print('\tBatch {}/{}: \t\t loss: {},\t acc: {}'.format(b+1, count_batches, train_loss[-1], train_acc[-1]))
-        history['loss'].append(np.asarray(train_loss).mean())
-        history['acc'].append(np.asarray(train_acc).mean())
-        # Validation a epoch
-        x_val, y_val = get_batch(val_path, val_list, BATCH_SIZE)
-        hist = model.test_on_batch(x_val, y_val)
-        history['val_loss'].append(hist[0])
-        history['val_acc'].append(hist[1])
-        print('\nTest loss: {},\t test accuracy: {}'.format(history['val_loss'][-1], history['val_acc'][-1]))
+    history = model.fit_generator(
+        generator(data_path, train_list, BATCH_SIZE),
+        steps_per_epoch=count_batches,
+        epochs=EPOCHES,
+        verbose=1,
+        max_queue_size=100,
+        use_multiprocessing=True,
+        workers=cpu_count(),
+        callbacks=[
+            ModelCheckpoint(
+                os.path.join(WEIGHTS_DIR, 'Epoch_{epoch:02d}___Loss_{loss:.4f}___Acc_{acc:.4f}.hdf5'),
+                monitor='acc',
+                verbose=1,
+                save_weights_only=True,
+                save_best_only=True)
+        ])
     return history
 
 
@@ -173,7 +156,7 @@ def create_folder_results():
     return results_path
 
 
-def plot_results(results_path, model, history):
+def plot_results(results_path, history):
     """
     Plot results of training
     @param history: history of training
@@ -213,11 +196,11 @@ def launch_network(gpus, data_path, train_list_file, val_list_file):
     @param val_list_file: file contained validation data and its labels
     """
     optimizer = get_optimizer()
-    parallel_model, model = get_model(optimizer, gpus)
-    history = train(parallel_model, data_path, train_list_file, val_list_file)
+    model = get_model(optimizer, gpus)
+    history = train(model, data_path, train_list_file, val_list_file)
     results_path = create_folder_results()
     save_model(results_path, model)
-    plot_results(results_path, model, history)
+    #plot_results(results_path, history.history)
 
 
 def init_argparse():
@@ -227,12 +210,12 @@ def init_argparse():
     """
     parser = ArgumentParser(description='MobileNet v.1 network')
     parser.add_argument(
-        '-gpu',
-        '--gpus',
+        '-gpus',
+        '--count_gpus',
         nargs='?',
-        help='GPU device numbers (0,1,3,...)',
-        default='0',
-        type=str)
+        help='count of using GPUs',
+        default=1,
+        type=int)
     parser.add_argument(
         '-data',
         '--data_path',
@@ -262,7 +245,7 @@ def main():
     Main function
     """
     args = init_argparse().parse_args()
-    gpus = get_gpus(args.gpus)
+    gpus = args.count_gpus
     data_path = args.data_path
     train_list_file = args.train_list
     val_list_file = args.validation_list
