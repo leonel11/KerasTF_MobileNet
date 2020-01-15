@@ -1,0 +1,9 @@
+# Files
+*.png
+*.jpg
+
+#Folders
+Tensorflow_Retraining
+.idea
+*/flower_photos
+*/results
